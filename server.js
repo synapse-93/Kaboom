@@ -10,6 +10,8 @@ const { MongoClient, ServerApiVersion } = require('mongodb');
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const MAX_FILE = 10 * 1024 * 1024;
+const TRANSFER_CHUNK = 3 * 1024 * 1024;
+const UPLOAD_LIFETIME_MS = 30 * 60 * 1000;
 const TOTAL_QUOTA = 50 * 1024 * 1024;
 const UPLOADS_PER_HOUR = 20;
 const SESSION_HOURS = 8;
@@ -22,10 +24,12 @@ let db;
 let files;
 let sessions;
 let controls;
+let users;
+let pendingUploads;
+let uploadChunks;
 let ownerUsername;
-let passwordSalt;
-let passwordHash;
 let uploadQueue = Promise.resolve();
+let initialization;
 
 function loadEnvFile() {
   const envPath = path.join(ROOT, '.env');
@@ -48,12 +52,6 @@ const LEGACY_DATA_DIR = path.resolve(process.env.LEGACY_DATA_DIR || path.join(RO
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
 const MAX_UPLOADS_IN_FLIGHT = 3;
 let activeUploads = 0;
-
-function timingSafeString(a, b) {
-  const first = Buffer.from(String(a));
-  const second = Buffer.from(String(b));
-  return first.length === second.length && crypto.timingSafeEqual(first, second);
-}
 
 function makeError(status, message) {
   const error = new Error(message);
@@ -243,10 +241,32 @@ function rateLimitState(key) {
   return current;
 }
 
-function authenticatePassword(candidate) {
+function normalizeUsername(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function validUsername(value) {
+  return /^[a-z0-9][a-z0-9_-]{2,23}$/.test(value);
+}
+
+function makePasswordCredentials(password) {
+  const salt = crypto.randomBytes(16);
+  return { passwordSalt: salt, passwordHash: crypto.scryptSync(password, salt, 64) };
+}
+
+function authenticatePassword(candidate, user) {
   if (typeof candidate !== 'string' || candidate.length > 1024) return false;
-  const candidateHash = crypto.scryptSync(candidate, passwordSalt, 64);
-  return crypto.timingSafeEqual(candidateHash, passwordHash);
+  const salt = user?.passwordSalt || Buffer.alloc(16);
+  const expected = user?.passwordHash || crypto.scryptSync('invalid-user-password', salt, 64);
+  const candidateHash = crypto.scryptSync(candidate, salt, 64);
+  return crypto.timingSafeEqual(candidateHash, expected) && Boolean(user);
+}
+
+async function createSession(username, res) {
+  const rawSession = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + SESSION_HOURS * 3600000);
+  await sessions.insertOne({ _id: sessionIdHash(rawSession), username, createdAt: new Date(), expiresAt });
+  return send(res, 200, { ok: true }, undefined, { 'Set-Cookie': 'drop_session=' + rawSession + '; ' + cookieOptions(SESSION_HOURS * 3600) });
 }
 
 async function migrateLegacyFiles() {
@@ -290,13 +310,13 @@ async function migrateLegacyFiles() {
 
 async function initialize() {
   if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is missing. Copy .env.example to .env and configure your MongoDB URI.');
-  ownerUsername = process.env.OWNER_USERNAME || 'owner';
+  const configuredOwnerUsername = String(process.env.OWNER_USERNAME || 'owner').trim();
+  ownerUsername = normalizeUsername(configuredOwnerUsername);
   const ownerPassword = process.env.OWNER_PASSWORD || '';
+  if (!validUsername(ownerUsername)) throw new Error('OWNER_USERNAME must be 3-24 characters: letters, numbers, underscore, or hyphen.');
   if (ownerPassword.length < 12 || ownerPassword === 'replace-with-a-strong-private-passphrase') {
     throw new Error('Set OWNER_PASSWORD in .env to a private passphrase of at least 12 characters.');
   }
-  passwordSalt = crypto.randomBytes(16);
-  passwordHash = crypto.scryptSync(ownerPassword, passwordSalt, 64);
   mongoClient = new MongoClient(process.env.MONGODB_URI, {
     appName: 'drop-space-file-sharing',
     maxPoolSize: 10,
@@ -308,10 +328,26 @@ async function initialize() {
   files = db.collection('files');
   sessions = db.collection('sessions');
   controls = db.collection('app_control');
+  users = db.collection('users');
+  pendingUploads = db.collection('pending_uploads');
+  uploadChunks = db.collection('upload_chunks');
+  if (configuredOwnerUsername !== ownerUsername) {
+    await files.updateMany({ ownerId: configuredOwnerUsername }, { $set: { ownerId: ownerUsername } });
+  }
+  const bootstrapCredentials = makePasswordCredentials(ownerPassword);
+  await users.updateOne(
+    { _id: ownerUsername },
+    { $setOnInsert: { username: ownerUsername, ...bootstrapCredentials, createdAt: new Date(), source: 'environment' } },
+    { upsert: true }
+  );
   await Promise.all([
     files.createIndex({ shareToken: 1 }, { unique: true, name: 'share_token_unique' }),
     files.createIndex({ ownerId: 1, createdAt: -1 }, { name: 'owner_created' }),
-    sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'session_expiry' })
+    sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'session_expiry' }),
+    pendingUploads.createIndex({ uploadDeadline: 1 }, { expireAfterSeconds: 0, name: 'pending_upload_expiry' }),
+    pendingUploads.createIndex({ ownerId: 1, uploadDeadline: 1 }, { name: 'owner_pending_uploads' }),
+    uploadChunks.createIndex({ uploadDeadline: 1 }, { expireAfterSeconds: 0, name: 'upload_chunk_expiry' }),
+    uploadChunks.createIndex({ uploadId: 1, chunkIndex: 1 }, { name: 'upload_chunk_order' })
   ]);
   await migrateLegacyFiles();
 }
@@ -335,6 +371,30 @@ async function handler(req, res) {
   }
   if (method === 'GET' && url.pathname === '/app.js') return serveStatic(res, 'app.js');
 
+  if (method === 'POST' && url.pathname === '/api/register') {
+    if (!sameOrigin(req)) return fail(res, 403, 'Request origin was rejected.');
+    const ip = req.socket.remoteAddress || 'unknown';
+    const state = rateLimitState('register:' + ip);
+    if (state.attempts >= LOGIN_ATTEMPTS) {
+      const retry = Math.max(1, Math.ceil((LOGIN_WINDOW_MS - (Date.now() - state.startedAt)) / 1000));
+      return fail(res, 429, 'Too many account creation attempts. Try again in 15 minutes.', { 'Retry-After': String(retry) });
+    }
+    state.attempts += 1;
+    try {
+      const body = await readJson(req, 4096);
+      const username = normalizeUsername(body.username);
+      const password = body.password;
+      if (!validUsername(username)) return fail(res, 400, 'Username must be 3-24 characters using letters, numbers, underscores, or hyphens.');
+      if (typeof password !== 'string' || password.length < 12 || password.length > 1024) return fail(res, 400, 'Password must be at least 12 characters.');
+      const credentials = makePasswordCredentials(password);
+      await users.insertOne({ _id: username, username, ...credentials, createdAt: new Date(), source: 'self-service' });
+      return await createSession(username, res);
+    } catch (error) {
+      if (error.code === 11000) return fail(res, 409, 'That username is already in use. Choose another.');
+      return fail(res, error.status || 503, error.status ? error.message : 'Account creation is unavailable. Check the MongoDB connection.');
+    }
+  }
+
   if (method === 'POST' && url.pathname === '/api/login') {
     if (!sameOrigin(req)) return fail(res, 403, 'Request origin was rejected.');
     const ip = req.socket.remoteAddress || 'unknown';
@@ -345,17 +405,15 @@ async function handler(req, res) {
     }
     try {
       const body = await readJson(req, 4096);
-      const usernameOk = timingSafeString(body.username || '', ownerUsername);
-      const passwordOk = authenticatePassword(body.password);
-      if (!usernameOk || !passwordOk) {
+      const username = normalizeUsername(body.username);
+      const user = await users.findOne({ _id: username });
+      const passwordOk = authenticatePassword(body.password, user);
+      if (!validUsername(username) || !passwordOk) {
         state.attempts += 1;
         return fail(res, 401, 'That username or password is not correct.');
       }
       loginAttempts.delete(ip);
-      const rawSession = crypto.randomBytes(32).toString('hex');
-      const expiresAt = new Date(Date.now() + SESSION_HOURS * 3600000);
-      await sessions.insertOne({ _id: sessionIdHash(rawSession), username: ownerUsername, createdAt: new Date(), expiresAt });
-      return send(res, 200, { ok: true }, undefined, { 'Set-Cookie': 'drop_session=' + rawSession + '; ' + cookieOptions(SESSION_HOURS * 3600) });
+      return await createSession(username, res);
     } catch (error) {
       return fail(res, error.status || 503, error.status ? error.message : 'Sign-in service is unavailable.');
     }
@@ -369,20 +427,23 @@ async function handler(req, res) {
     return send(res, 200, { ok: true }, undefined, { 'Set-Cookie': 'drop_session=; ' + cookieOptions(0) });
   }
 
-  if (url.pathname === '/api/owner' || url.pathname.startsWith('/api/files') || url.pathname === '/api/session') {
+  let authenticatedUser = null;
+  if (url.pathname === '/api/owner' || url.pathname.startsWith('/api/files') || url.pathname.startsWith('/api/uploads') || url.pathname === '/api/session') {
     const session = await requireOwner(req, res);
     if (!session) return;
+    authenticatedUser = session;
   }
 
-  if (method === 'GET' && url.pathname === '/api/session') return send(res, 200, { username: ownerUsername });
+  if (method === 'GET' && url.pathname === '/api/session') return send(res, 200, { username: authenticatedUser.username });
 
   if (method === 'GET' && url.pathname === '/api/owner') {
     const [list, usage, uploadsThisHour] = await Promise.all([
-      files.find({ ownerId: ownerUsername }, { projection: { data: 0 } }).sort({ createdAt: -1 }).toArray(),
-      files.aggregate([{ $match: { ownerId: ownerUsername } }, { $group: { _id: null, bytes: { $sum: '$size' } } }]).toArray(),
-      files.countDocuments({ ownerId: ownerUsername, createdAt: { $gte: new Date(Date.now() - 3600000) } })
+      files.find({ ownerId: authenticatedUser.username }, { projection: { data: 0 } }).sort({ createdAt: -1 }).toArray(),
+      files.aggregate([{ $match: { ownerId: authenticatedUser.username } }, { $group: { _id: null, bytes: { $sum: '$size' } } }]).toArray(),
+      files.countDocuments({ ownerId: authenticatedUser.username, createdAt: { $gte: new Date(Date.now() - 3600000) } })
     ]);
     return send(res, 200, {
+      username: authenticatedUser.username,
       files: list.map(publicRecord),
       usedBytes: usage[0]?.bytes || 0,
       quotaBytes: TOTAL_QUOTA,
@@ -390,6 +451,126 @@ async function handler(req, res) {
       uploadsThisHour,
       uploadLimit: UPLOADS_PER_HOUR
     });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/uploads') {
+    if (!sameOrigin(req)) return fail(res, 403, 'Request origin was rejected.');
+    try {
+      const body = await readJson(req, 4096);
+      const size = Number(body.fileSize);
+      if (!Number.isSafeInteger(size) || size < 1 || size > MAX_FILE) return fail(res, 413, 'Choose a non-empty file up to 10 MB.');
+      const createdAt = new Date();
+      let expiresAt;
+      if (body.expiresAt) expiresAt = new Date(body.expiresAt);
+      else {
+        const expiryHours = Number(body.expiryHours || 24);
+        if (!Number.isFinite(expiryHours) || expiryHours <= 0 || expiryHours > 720) return fail(res, 400, 'Choose a valid link expiry.');
+        expiresAt = new Date(createdAt.getTime() + expiryHours * 3600000);
+      }
+      const duration = expiresAt.getTime() - createdAt.getTime();
+      if (Number.isNaN(expiresAt.getTime()) || duration < 60000 || duration > 30 * 24 * 3600000) {
+        return fail(res, 400, 'Expiry must be at least 1 minute and no more than 30 days from now.');
+      }
+      const [usage, recentCount, openCount, pendingUsage] = await Promise.all([
+        files.aggregate([{ $match: { ownerId: authenticatedUser.username } }, { $group: { _id: null, bytes: { $sum: '$size' } } }]).toArray(),
+        files.countDocuments({ ownerId: authenticatedUser.username, createdAt: { $gte: new Date(createdAt.getTime() - 3600000) } }),
+        pendingUploads.countDocuments({ ownerId: authenticatedUser.username, uploadDeadline: { $gt: createdAt } }),
+        pendingUploads.aggregate([{ $match: { ownerId: authenticatedUser.username, uploadDeadline: { $gt: createdAt } } }, { $group: { _id: null, bytes: { $sum: '$size' } } }]).toArray()
+      ]);
+      if (recentCount >= UPLOADS_PER_HOUR) return fail(res, 429, 'The limit is 20 uploads per hour. Try again after the oldest upload leaves the rolling hour window.');
+      if (openCount >= 3) return fail(res, 429, 'Finish or wait for an existing upload before starting another.');
+      if ((usage[0]?.bytes || 0) + (pendingUsage[0]?.bytes || 0) + size > TOTAL_QUOTA) return fail(res, 413, 'This upload would exceed your 50 MB storage quota.');
+      const id = crypto.randomUUID();
+      const uploadDeadline = new Date(createdAt.getTime() + UPLOAD_LIFETIME_MS);
+      const upload = {
+        _id: id,
+        ownerId: authenticatedUser.username,
+        name: safeName(body.filename),
+        size,
+        chunkCount: Math.ceil(size / TRANSFER_CHUNK),
+        expiresAt,
+        createdAt,
+        uploadDeadline
+      };
+      await pendingUploads.insertOne(upload);
+      return send(res, 201, { uploadId: id, chunkSize: TRANSFER_CHUNK, chunkCount: upload.chunkCount });
+    } catch (error) {
+      return fail(res, error.status || 503, error.status ? error.message : 'Upload could not be started. Check the MongoDB connection.');
+    }
+  }
+
+  const chunkRoute = /^\/api\/uploads\/([a-f0-9-]+)\/chunks\/(\d+)$/.exec(url.pathname);
+  if (method === 'POST' && chunkRoute) {
+    if (!sameOrigin(req)) return fail(res, 403, 'Request origin was rejected.');
+    try {
+      const upload = await pendingUploads.findOne({ _id: chunkRoute[1], ownerId: authenticatedUser.username, uploadDeadline: { $gt: new Date() } });
+      if (!upload) return fail(res, 404, 'Upload not found or it expired. Start the upload again.');
+      const chunkIndex = Number(chunkRoute[2]);
+      if (!Number.isSafeInteger(chunkIndex) || chunkIndex >= upload.chunkCount) return fail(res, 400, 'Upload chunk number is invalid.');
+      const expectedSize = Math.min(TRANSFER_CHUNK, upload.size - chunkIndex * TRANSFER_CHUNK);
+      const data = await readBody(req, TRANSFER_CHUNK);
+      if (data.length !== expectedSize) return fail(res, 400, 'Upload chunk size did not match. Retry the upload.');
+      await uploadChunks.updateOne(
+        { _id: upload._id + ':' + chunkIndex, ownerId: authenticatedUser.username },
+        { $setOnInsert: { uploadId: upload._id, ownerId: authenticatedUser.username, chunkIndex, size: data.length, data, uploadDeadline: upload.uploadDeadline } },
+        { upsert: true }
+      );
+      return send(res, 200, { ok: true, chunkIndex });
+    } catch (error) {
+      return fail(res, error.status || 503, error.status ? error.message : 'Upload chunk could not be saved.');
+    }
+  }
+
+  const completeUpload = /^\/api\/uploads\/([a-f0-9-]+)\/complete$/.exec(url.pathname);
+  if (method === 'POST' && completeUpload) {
+    if (!sameOrigin(req)) return fail(res, 403, 'Request origin was rejected.');
+    const uploadId = completeUpload[1];
+    try {
+      const existing = await files.findOne({ _id: uploadId, ownerId: authenticatedUser.username });
+      if (existing) {
+        await Promise.all([pendingUploads.deleteOne({ _id: uploadId, ownerId: authenticatedUser.username }), uploadChunks.deleteMany({ uploadId, ownerId: authenticatedUser.username })]);
+        return send(res, 201, { file: publicRecord(existing) });
+      }
+      const session = mongoClient.startSession();
+      let saved;
+      try {
+        await session.withTransaction(async () => {
+          const upload = await pendingUploads.findOne({ _id: uploadId, ownerId: authenticatedUser.username, uploadDeadline: { $gt: new Date() } }, { session });
+          if (!upload) throw makeError(404, 'Upload not found or it expired. Start the upload again.');
+          const parts = await uploadChunks.find({ uploadId, ownerId: authenticatedUser.username }, { session }).sort({ chunkIndex: 1 }).toArray();
+          if (parts.length !== upload.chunkCount || parts.some((part, index) => part.chunkIndex !== index)) throw makeError(400, 'Some upload chunks are missing. Retry the upload.');
+          const data = Buffer.concat(parts.map(part => Buffer.isBuffer(part.data) ? part.data : Buffer.from(part.data.buffer || part.data)));
+          if (data.length !== upload.size) throw makeError(400, 'Uploaded file size did not match. Start the upload again.');
+          const now = new Date();
+          const usage = await files.aggregate([{ $match: { ownerId: authenticatedUser.username } }, { $group: { _id: null, bytes: { $sum: '$size' } } }], { session }).toArray();
+          const recentCount = await files.countDocuments({ ownerId: authenticatedUser.username, createdAt: { $gte: new Date(now.getTime() - 3600000) } }, { session });
+          if ((usage[0]?.bytes || 0) + data.length > TOTAL_QUOTA) throw makeError(413, 'This upload would exceed your 50 MB storage quota.');
+          if (recentCount >= UPLOADS_PER_HOUR) throw makeError(429, 'The limit is 20 uploads per hour. Try again after the oldest upload leaves the rolling hour window.');
+          saved = {
+            _id: upload._id,
+            ownerId: authenticatedUser.username,
+            shareToken: crypto.randomBytes(32).toString('base64url'),
+            name: upload.name,
+            size: data.length,
+            createdAt: now,
+            expiresAt: upload.expiresAt,
+            downloads: 0,
+            revoked: false,
+            data
+          };
+          await files.insertOne(saved, { session });
+          await pendingUploads.deleteOne({ _id: uploadId, ownerId: authenticatedUser.username }, { session });
+          await uploadChunks.deleteMany({ uploadId, ownerId: authenticatedUser.username }, { session });
+        });
+      } finally { await session.endSession(); }
+      return send(res, 201, { file: publicRecord(saved) });
+    } catch (error) {
+      if (error.code === 11000) {
+        const existing = await files.findOne({ _id: uploadId, ownerId: authenticatedUser.username });
+        if (existing) return send(res, 201, { file: publicRecord(existing) });
+      }
+      return fail(res, error.status || 503, error.status ? error.message : 'Upload could not be finalized. Check the MongoDB connection.');
+    }
   }
 
   if (method === 'POST' && url.pathname === '/api/files') {
@@ -404,18 +585,18 @@ async function handler(req, res) {
       const saved = await withUploadLock(async () => {
         const now = new Date();
         const [used, count] = await Promise.all([
-          files.aggregate([{ $match: { ownerId: ownerUsername } }, { $group: { _id: null, bytes: { $sum: '$size' } } }]).toArray(),
-          files.countDocuments({ ownerId: ownerUsername, createdAt: { $gte: new Date(now.getTime() - 3600000) } })
+          files.aggregate([{ $match: { ownerId: authenticatedUser.username } }, { $group: { _id: null, bytes: { $sum: '$size' } } }]).toArray(),
+          files.countDocuments({ ownerId: authenticatedUser.username, createdAt: { $gte: new Date(now.getTime() - 3600000) } })
         ]);
         if ((used[0]?.bytes || 0) + upload.data.length > TOTAL_QUOTA) throw makeError(413, 'This upload would exceed the 50 MB owner storage quota.');
         if (count >= UPLOADS_PER_HOUR) {
-          const oldest = await files.find({ ownerId: ownerUsername, createdAt: { $gte: new Date(now.getTime() - 3600000) } }).sort({ createdAt: 1 }).limit(1).next();
+          const oldest = await files.find({ ownerId: authenticatedUser.username, createdAt: { $gte: new Date(now.getTime() - 3600000) } }).sort({ createdAt: 1 }).limit(1).next();
           const seconds = oldest ? Math.max(1, Math.ceil((oldest.createdAt.getTime() + 3600000 - now.getTime()) / 1000)) : 3600;
           throw Object.assign(makeError(429, 'The limit is 20 uploads per hour. Try again after the oldest upload leaves the rolling hour window.'), { retryAfter: seconds });
         }
         const doc = {
           _id: crypto.randomUUID(),
-          ownerId: ownerUsername,
+          ownerId: authenticatedUser.username,
           shareToken: crypto.randomBytes(32).toString('base64url'),
           name: safeName(upload.filename),
           size: upload.data.length,
@@ -447,7 +628,7 @@ async function handler(req, res) {
         return fail(res, 400, 'Expiry must be at least 1 minute and no more than 30 days from now.');
       }
       const result = await files.updateOne(
-        { _id: expiryEdit[1], ownerId: ownerUsername, revoked: false },
+        { _id: expiryEdit[1], ownerId: authenticatedUser.username, revoked: false },
         { $set: { expiresAt, expiryUpdatedAt: new Date() } }
       );
       if (!result.matchedCount) return fail(res, 404, 'File not found or its link has been revoked.');
@@ -462,11 +643,11 @@ async function handler(req, res) {
     if (!sameOrigin(req)) return fail(res, 403, 'Request origin was rejected.');
     const id = action[1];
     if (action[2] === 'revoke') {
-      const result = await files.updateOne({ _id: id, ownerId: ownerUsername }, { $set: { revoked: true, revokedAt: new Date() } });
+      const result = await files.updateOne({ _id: id, ownerId: authenticatedUser.username }, { $set: { revoked: true, revokedAt: new Date() } });
       if (!result.matchedCount) return fail(res, 404, 'File not found.');
       return send(res, 200, { ok: true });
     }
-    const result = await files.deleteOne({ _id: id, ownerId: ownerUsername });
+    const result = await files.deleteOne({ _id: id, ownerId: authenticatedUser.username });
     if (!result.deletedCount) return fail(res, 404, 'File not found.');
     return send(res, 200, { ok: true });
   }
@@ -477,7 +658,38 @@ async function handler(req, res) {
     if (!item) return fail(res, 404, 'This share link is invalid.');
     if (item.revoked) return fail(res, 410, 'The owner revoked this share link.');
     if (Date.now() >= item.expiresAt.getTime()) return fail(res, 410, 'This share link has expired.');
-    return send(res, 200, { name: item.name, size: item.size, expiresAt: item.expiresAt, downloadUrl: '/download/' + item.shareToken });
+    return send(res, 200, { name: item.name, size: item.size, expiresAt: item.expiresAt, downloadUrl: '/api/download/' + item.shareToken });
+  }
+
+  const chunkDownload = /^\/api\/download\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
+  if (method === 'GET' && chunkDownload) {
+    const offset = Number(url.searchParams.get('offset') || 0);
+    if (!Number.isSafeInteger(offset) || offset < 0) return fail(res, 400, 'Download chunk offset is invalid.');
+    let item;
+    if (offset === 0) {
+      item = await files.findOneAndUpdate(
+        { shareToken: chunkDownload[1], revoked: false, expiresAt: { $gt: new Date() } },
+        { $inc: { downloads: 1 } },
+        { returnDocument: 'after' }
+      );
+    } else {
+      item = await files.findOne({ shareToken: chunkDownload[1], revoked: false, expiresAt: { $gt: new Date() } });
+    }
+    if (!item) {
+      const known = await files.findOne({ shareToken: chunkDownload[1] }, { projection: { revoked: 1, expiresAt: 1 } });
+      if (!known) return fail(res, 404, 'This share link is invalid.');
+      if (known.revoked) return fail(res, 410, 'The owner revoked this share link.');
+      return fail(res, 410, 'This share link has expired.');
+    }
+    if (offset >= item.size) return fail(res, 416, 'Download chunk offset is out of range.');
+    const data = Buffer.isBuffer(item.data) ? item.data : Buffer.from(item.data.buffer || item.data);
+    const end = Math.min(item.size, offset + TRANSFER_CHUNK);
+    const part = data.subarray(offset, end);
+    return send(res, 206, part, 'application/octet-stream', {
+      'Content-Length': String(part.length),
+      'Content-Range': 'bytes ' + offset + '-' + (end - 1) + '/' + item.size,
+      'Accept-Ranges': 'bytes'
+    });
   }
 
   if (method === 'GET' && url.pathname.startsWith('/download/')) {
@@ -505,8 +717,18 @@ async function handler(req, res) {
   return fail(res, 404, 'Page not found.');
 }
 
+async function ensureInitialized() {
+  if (!initialization) {
+    initialization = initialize().catch(error => {
+      initialization = null;
+      throw error;
+    });
+  }
+  return initialization;
+}
+
 async function start() {
-  await initialize();
+  await ensureInitialized();
   const server = http.createServer((req, res) => {
     handler(req, res).catch(error => {
       if (!res.headersSent) fail(res, error.status || 500, error.status ? error.message : 'Something went wrong.');
@@ -525,7 +747,23 @@ async function start() {
   process.on('SIGTERM', close);
 }
 
-start().catch(error => {
-  console.error('Could not start Drop Space:', error.message);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  start().catch(error => {
+    console.error('Could not start Drop Space:', error.message);
+    process.exitCode = 1;
+  });
+} else {
+  module.exports = async function vercelHandler(req, res) {
+    try {
+      await ensureInitialized();
+      const url = new URL(req.url, 'https://' + (req.headers.host || 'vercel.local'));
+      if (url.pathname === '/api/download' && url.searchParams.has('token')) {
+        req.url = '/api/download/' + encodeURIComponent(url.searchParams.get('token')) + (url.searchParams.has('offset') ? '?offset=' + encodeURIComponent(url.searchParams.get('offset')) : '');
+      }
+      return await handler(req, res);
+    } catch (error) {
+      if (!res.headersSent) return fail(res, error.status || 500, error.status ? error.message : 'Something went wrong.');
+      res.destroy();
+    }
+  };
+}

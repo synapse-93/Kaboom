@@ -16,14 +16,16 @@
       <p class="login-footnote">Private by design · Links expire when you say so</p>
     </section>
     <section class="login-panel">
-      <div class="login-panel-inner"><span class="login-lock">⌑</span><p class="eyebrow">OWNER ACCESS</p><h2>Welcome back</h2><p class="login-hint">Sign in to manage your shared files.</p>
+      <div class="login-panel-inner"><span class="login-lock">⌑</span><p class="eyebrow">ACCOUNT ACCESS</p><h2 id="form-title">Welcome back</h2><p id="form-hint" class="login-hint">Sign in to manage your shared files.</p>
         <form id="login-form" autocomplete="on">
           <label for="username">Username</label><input id="username" name="username" type="text" autocomplete="username" required autofocus>
           <div class="password-label"><label for="password">Password</label></div><div class="password-field"><input id="password" name="password" type="password" autocomplete="current-password" required><button type="button" id="toggle-password" aria-label="Show password">Show</button></div>
+          <p id="password-hint" class="password-hint" hidden>Use at least 12 characters.</p>
           <p id="login-error" class="login-error" role="alert"></p>
-          <button class="button primary login-submit" type="submit">Sign in <span>→</span></button>
+          <button id="submit-label" class="button primary login-submit" type="submit">Sign in <span>→</span></button>
         </form>
-        <div class="login-secure"><span>●</span> Protected owner session · Private to this device</div>
+        <div class="login-switch"><span id="switch-copy">New to Drop Space?</span><button id="switch-mode" type="button">Create an account</button></div>
+        <div class="login-secure"><span>●</span> Passwords are securely hashed · Private account sessions</div>
       </div>
     </section>
   </main>

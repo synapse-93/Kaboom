@@ -11,7 +11,54 @@ const progress = document.getElementById('upload-progress');
 const expiry = document.getElementById('expiry');
 const customExpiry = document.getElementById('custom-expiry');
 let currentFiles = [];
+let editingFileId = null;
+const expiryDialog = document.getElementById('expiry-dialog');
+const editExpiry = document.getElementById('edit-expiry');
+const expiryError = document.getElementById('expiry-error');
+const saveExpiry = document.getElementById('save-expiry');
 const fmtBytes = bytes => bytes < 1024 * 1024 ? (bytes / 1024).toFixed(0) + ' KB' : (bytes / 1024 / 1024).toFixed(1) + ' MB';
+const fmtDate = value => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short', timeZoneName: 'short' }).format(new Date(value));
+
+document.getElementById('time-zone-note').textContent = 'Shared and expiry times use ' + Intl.DateTimeFormat().resolvedOptions().timeZone + '. MongoDB stores dates in UTC.';
+document.getElementById('cancel-expiry').addEventListener('click', () => expiryDialog.close());
+saveExpiry.addEventListener('click', saveFileExpiry);
+expiryDialog.addEventListener('close', () => { editingFileId = null; expiryError.textContent = ''; saveExpiry.disabled = false; });
+
+function localInputValue(date) {
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+
+function openExpiryEditor(file) {
+  editingFileId = file.id;
+  const now = new Date(Date.now() + 60000);
+  editExpiry.min = localInputValue(now);
+  editExpiry.value = localInputValue(new Date(file.expiresAt));
+  expiryError.textContent = '';
+  expiryDialog.showModal();
+}
+
+async function saveFileExpiry() {
+  if (!editingFileId || !editExpiry.value) { expiryError.textContent = 'Choose a new expiry date and time.'; return; }
+  const selected = new Date(editExpiry.value);
+  if (Number.isNaN(selected.getTime()) || selected.getTime() < Date.now() + 60000) { expiryError.textContent = 'Choose an expiry at least one minute in the future.'; return; }
+  saveExpiry.disabled = true;
+  expiryError.textContent = 'Saving…';
+  try {
+    const response = await fetch('/api/files/' + editingFileId + '/expiry', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expiresAt: selected.toISOString() })
+    });
+    const data = await response.json();
+    if (response.status === 401) { location.replace('/login'); return; }
+    if (!response.ok) throw new Error(data.error || 'Could not update the expiry.');
+    expiryDialog.close();
+    await loadFiles();
+  } catch (error) {
+    expiryError.textContent = error.message;
+  } finally {
+    saveExpiry.disabled = false;
+  }
+}
 
 function updateSelectedFile() {
   const file = input.files[0];
@@ -57,13 +104,13 @@ form.addEventListener('submit', async event => {
   progress.hidden = false;
   progress.classList.add('is-active');
   try {
-    const formData = new FormData(form);
+    const options = { filename: file.name, fileSize: file.size, expiryHours: Number(expiry.value === 'custom' ? 24 : expiry.value) };
     if (expiry.value === 'custom') {
       const selected = new Date(customExpiry.value);
       if (!customExpiry.value || Number.isNaN(selected.getTime()) || selected.getTime() < Date.now() + 60000) throw new Error('Choose an expiry at least one minute in the future.');
-      formData.set('expiresAt', selected.toISOString());
+      options.expiresAt = selected.toISOString();
     }
-    const result = await uploadFile(formData);
+    const result = await uploadFile(file, options);
     const link = new URL(result.file.shareUrl, location.origin).href;
     message.replaceChildren();
     const text = document.createElement('span');
@@ -96,23 +143,33 @@ form.addEventListener('submit', async event => {
   }
 });
 
-function uploadFile(formData) {
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open('POST', '/api/files');
-    request.upload.addEventListener('progress', event => {
-      if (event.lengthComputable) progress.value = Math.round(event.loaded / event.total * 100);
-    });
-    request.addEventListener('load', () => {
-      let data;
-      try { data = JSON.parse(request.responseText); } catch { reject(new Error('The server returned an unreadable response.')); return; }
-      if (request.status === 401) { location.replace('/login'); reject(new Error('Your session expired. Sign in again.')); return; }
-      if (request.status < 200 || request.status >= 300) reject(new Error(data.error || 'Upload failed.'));
-      else resolve(data);
-    });
-    request.addEventListener('error', () => reject(new Error('Upload failed. Check the MongoDB connection and try again.')));
-    request.send(formData);
+async function uploadFile(file, options) {
+  const startResponse = await fetch('/api/uploads', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(options)
   });
+  const started = await startResponse.json();
+  if (startResponse.status === 401) { location.replace('/login'); throw new Error('Your session expired. Sign in again.'); }
+  if (!startResponse.ok) throw new Error(started.error || 'Could not start the upload.');
+  const chunkSize = started.chunkSize;
+  for (let index = 0; index < started.chunkCount; index += 1) {
+    const start = index * chunkSize;
+    const chunk = file.slice(start, Math.min(file.size, start + chunkSize));
+    const response = await fetch('/api/uploads/' + started.uploadId + '/chunks/' + index, {
+      method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk
+    });
+    const result = await response.json();
+    if (response.status === 401) { location.replace('/login'); throw new Error('Your session expired. Sign in again.'); }
+    if (!response.ok) throw new Error(result.error || 'Could not save upload part ' + (index + 1) + '.');
+    progress.value = Math.round(Math.min(file.size, start + chunk.size) / file.size * 92);
+    message.textContent = 'Uploading part ' + (index + 1) + ' of ' + started.chunkCount + '…';
+  }
+  message.textContent = 'Combining file parts and saving to MongoDB…';
+  const response = await fetch('/api/uploads/' + started.uploadId + '/complete', { method: 'POST' });
+  const result = await response.json();
+  if (response.status === 401) { location.replace('/login'); throw new Error('Your session expired. Sign in again.'); }
+  if (!response.ok) throw new Error(result.error || 'Could not finish the upload.');
+  progress.value = 100;
+  return result;
 }
 
 async function copyShareLink(link, button) {
@@ -144,6 +201,7 @@ async function loadFiles() {
     const data = await response.json();
     if (response.status === 401) { location.replace('/login'); return; }
     if (!response.ok) throw new Error(data.error || 'Could not load files.');
+    document.getElementById('account-username').textContent = data.username;
     quota.textContent = fmtBytes(data.usedBytes) + ' / ' + fmtBytes(data.quotaBytes) + ' · ' + Math.max(0, data.uploadLimit - data.uploadsThisHour) + ' uploads left this hour';
     quotaFill.value = Math.min(100, data.usedBytes / data.quotaBytes * 100);
     currentFiles = data.files;
@@ -181,7 +239,7 @@ function renderFiles() {
     const name = document.createElement('strong');
     name.textContent = file.name;
     const meta = document.createElement('span');
-    meta.textContent = fmtBytes(file.size) + ' · ' + file.downloads + ' download' + (file.downloads === 1 ? '' : 's') + ' · ' + (expired ? 'Expired' : 'Expires ' + new Date(file.expiresAt).toLocaleString());
+    meta.textContent = fmtBytes(file.size) + ' · ' + file.downloads + ' download' + (file.downloads === 1 ? '' : 's') + ' · Shared ' + fmtDate(file.createdAt) + ' · ' + (expired ? 'Expired' : 'Expires ' + fmtDate(file.expiresAt));
     info.append(name, meta);
     const actions = document.createElement('div');
     actions.className = 'actions';
@@ -196,6 +254,11 @@ function renderFiles() {
     copy.addEventListener('click', () => copyShareLink(new URL(file.shareUrl, location.origin).href, copy));
     actions.append(copy);
     if (!file.revoked) {
+      const edit = document.createElement('button');
+      edit.className = 'small-button';
+      edit.textContent = 'Edit expiry';
+      edit.addEventListener('click', () => openExpiryEditor(file));
+      actions.append(edit);
       const revoke = document.createElement('button');
       revoke.className = 'small-button';
       revoke.textContent = 'Revoke';
